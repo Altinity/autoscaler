@@ -103,6 +103,17 @@ func newManager() (*hetznerManager, error) {
 	clusterConfigBase64 := os.Getenv("HCLOUD_CLUSTER_CONFIG")
 	cloudInitBase64 := os.Getenv("HCLOUD_CLOUD_INIT")
 
+	if f := os.Getenv("HCLOUD_CLUSTER_CONFIG_FILE"); f != "" {
+		if clusterConfigBase64 != "" {
+			return nil, errors.New("`HCLOUD_CLUSTER_CONFIG` and `HCLOUD_CLUSTER_CONFIG_FILE` are mutually exclusive")
+		}
+		d, err := os.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		clusterConfigBase64 = base64.StdEncoding.EncodeToString(d)
+	}
+
 	if clusterConfigBase64 == "" && cloudInitBase64 == "" {
 		return nil, errors.New("`HCLOUD_CLUSTER_CONFIG` or `HCLOUD_CLOUD_INIT` is not specified")
 	}
