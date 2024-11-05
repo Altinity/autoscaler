@@ -32,12 +32,12 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
 	kretry "k8s.io/client-go/util/retry"
 	klog "k8s.io/klog/v2"
+	providerazureconsts "sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/retry"
 )
 
 const (
-	vmTypeVMSS     = "vmss"
-	vmTypeStandard = "standard"
+	azurePrefix = "azure://"
 
 	scaleToZeroSupportedStandard = false
 	scaleToZeroSupportedVMSS     = true
@@ -50,8 +50,19 @@ type AzureManager struct {
 	azClient *azClient
 	env      azure.Environment
 
-	azureCache           *azureCache
-	lastRefresh          time.Time
+	// azureCache is used for caching Azure resources.
+	// It keeps track of nodegroups and instances
+	// (and of which nodegroup instances belong to)
+	azureCache *azureCache
+	// lastRefresh is the time azureCache was last refreshed.
+	// Together with azureCache.refreshInterval is it used to decide whether
+	// it is time to refresh the cache from Azure resources.
+	//
+	// Cache invalidation can also be requested via invalidateCache()
+	// (used by both AzureManager and ScaleSet), which manipulates
+	// lastRefresh to force refresh on the next check.
+	lastRefresh time.Time
+
 	autoDiscoverySpecs   []labelAutoDiscoveryConfig
 	explicitlyConfigured map[string]bool
 }
@@ -90,10 +101,10 @@ func createAzureManagerInternal(configReader io.Reader, discoveryOpts cloudprovi
 	}
 
 	cacheTTL := refreshInterval
-	if cfg.VmssCacheTTL != 0 {
-		cacheTTL = time.Duration(cfg.VmssCacheTTL) * time.Second
+	if cfg.VmssCacheTTLInSeconds != 0 {
+		cacheTTL = time.Duration(cfg.VmssCacheTTLInSeconds) * time.Second
 	}
-	cache, err := newAzureCache(azClient, cacheTTL, cfg.ResourceGroup, cfg.VMType, cfg.EnableDynamicInstanceList, cfg.Location)
+	cache, err := newAzureCache(azClient, cacheTTL, *cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -153,19 +164,23 @@ func (m *AzureManager) fetchExplicitNodeGroups(specs []string) error {
 
 func (m *AzureManager) buildNodeGroupFromSpec(spec string) (cloudprovider.NodeGroup, error) {
 	scaleToZeroSupported := scaleToZeroSupportedStandard
-	if strings.EqualFold(m.config.VMType, vmTypeVMSS) {
+	if strings.EqualFold(m.config.VMType, providerazureconsts.VMTypeVMSS) {
 		scaleToZeroSupported = scaleToZeroSupportedVMSS
 	}
 	s, err := dynamic.SpecFromString(spec, scaleToZeroSupported)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse node group spec: %v", err)
 	}
+	vmsPoolSet := m.azureCache.getVMsPoolSet()
+	if _, ok := vmsPoolSet[s.Name]; ok {
+		return NewVMsPool(s, m), nil
+	}
 
 	switch m.config.VMType {
-	case vmTypeStandard:
+	case providerazureconsts.VMTypeStandard:
 		return NewAgentPool(s, m)
-	case vmTypeVMSS:
-		return NewScaleSet(s, m, -1)
+	case providerazureconsts.VMTypeVMSS:
+		return NewScaleSet(s, m, -1, false)
 	default:
 		return nil, fmt.Errorf("vmtype %s not supported", m.config.VMType)
 	}
@@ -193,6 +208,8 @@ func (m *AzureManager) forceRefresh() error {
 	return nil
 }
 
+// invalidateCache forces cache reload on the next check
+// by manipulating lastRefresh timestamp
 func (m *AzureManager) invalidateCache() {
 	m.lastRefresh = time.Now().Add(-1 * m.azureCache.refreshInterval)
 	klog.V(2).Infof("Invalidated Azure cache")
@@ -291,7 +308,7 @@ func (m *AzureManager) getFilteredNodeGroups(filter []labelAutoDiscoveryConfig) 
 		return nil, nil
 	}
 
-	if m.config.VMType == vmTypeVMSS {
+	if m.config.VMType == providerazureconsts.VMTypeVMSS {
 		return m.getFilteredScaleSets(filter)
 	}
 
@@ -356,7 +373,9 @@ func (m *AzureManager) getFilteredScaleSets(filter []labelAutoDiscoveryConfig) (
 			curSize = *scaleSet.Sku.Capacity
 		}
 
-		vmss, err := NewScaleSet(spec, m, curSize)
+		dedicatedHost := scaleSet.VirtualMachineScaleSetProperties != nil && scaleSet.VirtualMachineScaleSetProperties.HostGroup != nil
+
+		vmss, err := NewScaleSet(spec, m, curSize, dedicatedHost)
 		if err != nil {
 			klog.Warningf("ignoring vmss %q %s", *scaleSet.Name, err)
 			continue
